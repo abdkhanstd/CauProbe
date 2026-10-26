@@ -50,8 +50,8 @@ def draw(save):
     arrow(50.6, 35.5, 57.4, 35.5)
     arrow(77.6, 35.5, 84.4, 35.5)
     arrow(20.6, 14.5, 28.4, 14.5)
-    label(24.5, 5.8, "read only if\n"
-          r"$H_{\mathrm{eff}}\,\mathrm{VOI}_{ask} > c_{ask}$")
+    label(24.5, 5.8, "read only if its\n"
+          r"value $> c_{ask}$")
     arrow(39.5, 19.6, 39.5, 28.4, c="#2e9b5e")
     label(45.0, 24.0, "likelihood\nof answer", c="#2e9b5e")
     arrow(67.5, 19.6, 67.5, 30.4)
