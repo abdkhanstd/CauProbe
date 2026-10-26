@@ -1,0 +1,419 @@
+--- frozen/test2/causlm/probe/agent.py
++++ causlm/probe/agent.py
+@@ -116,6 +116,22 @@
+                                   # decay ("geometric")
+     fl_ask_truths: int = 32       # rollouts per structure when valuing a reading
+     fl_ask_mc: int = 64           # simulated readings per structure
++    fl_signed: bool = False       # analysis only: count per-structure gains
++                                  # signed instead of clipped at zero
++    fl_tau_scale: float = 1.0     # analysis only: multiply every estimated
++                                  # free-learning horizon (capped at the
++                                  # information horizon)
++    fs_audit: bool = False        # analysis only: at every probe valuation
++                                  # also value the candidates with the
++                                  # admissible sets frozen at the current
++                                  # posterior, and log both (_fs_log); the
++                                  # decision is unchanged
++    # Comparator (objective="rollout"): approximate dual control by
++    # Bayes-adaptive rollouts -- each candidate probe is valued by the
++    # simulated return of taking it and then continuing greedy control with
++    # Bayesian updating, against continuing greedily now.
++    rd_days: int = 3              # look-ahead of the rollouts, days
++    rd_truths: int = 8            # simulated truths per live structure
+     # Information is also lost to what operation does: where the posterior
+     # re-opens a question faster than the change hazard says it should (a
+     # library that does not quite fit the site), ruling it out lasts less.
+@@ -382,13 +398,21 @@
+                 q = float(np.clip(rho[-1] / rho[-2], 0.0, 1.0)) if rho[-2] > 1e-9 else 0.0
+                 geo = q * (1.0 - q ** T) / (1.0 - q) if q < 1.0 - 1e-9 else T
+                 tau[c] = float(rho @ days + rho[-1] * geo)
+-            return tau
++            return self._scale_tau(tau, sim, h_eff)
+         for c in sim:
+             m = cr == c
+             den = reg0[m].sum()
+             rho = (np.clip(reg[m].sum(0) / den, 0.0, 1.0) if den > 1e-9
+                    else np.ones(D))
+             tau[c] = float(rho @ days + rho[-1] * T)
++        return self._scale_tau(tau, sim, h_eff)
++
++    def _scale_tau(self, tau, idx, h):
++        """Analysis only (fl_tau_scale != 1): mis-scale the estimated
++        horizons of the simulated structures, capped at the horizon h."""
++        s = self.cfg.fl_tau_scale
++        if s != 1.0:
++            tau[idx] = np.minimum(tau[idx] * s, h)
+         return tau
+ 
+     def _tau_for(self, w, live, beta, Mw, U, PV, h_eff, hour):
+@@ -556,7 +580,14 @@
+                 info["vmax_fl"] = vmax
+                 pas = passing(vmax)
+             info["screened"] = not pas.any()
+-            if vmax > cfg.screen_eps and pas.any():
++            if cfg.objective == "rollout":
++                # comparator: approximate dual control by rollouts, behind
++                # the same exact screen
++                if vmax > cfg.screen_eps and pas.any():
++                    a, m = self._rollout_action(w, live, beta, Mw, U, PV, hour,
++                                                prev, np.flatnonzero(pas),
++                                                a_greedy, base, s_in)
++            elif vmax > cfg.screen_eps and pas.any():
+                 a, m = self._kg_action(w, beta, Mw, Uc, PVc, mu, s, base,
+                                        s_in, s_out, np.flatnonzero(pas),
+                                        a_greedy, live=live, tau=tau)
+@@ -580,6 +611,178 @@
+                 self._commit = (a, self.t + m)
+         info["P_viol"] = float(P[a])
+         return a, sp, ask, info
++
++    def _audit_frozen_sets(self, w, beta, Mw, Uc, PVc, mu, s, cand, ms, J, pj,
++                           V0, EV, voi, pen, base, live, tau, choice):
++        """Analysis only (fs_audit). The implemented valuation recomputes the
++        admissible set for every counterfactual posterior. Here the same
++        candidates are also valued with the set frozen at the current
++        posterior, and both are logged: the unclipped gains E[V(beta')] -
++        V(beta), the EVPI bound, and the choice each valuation would make."""
++        cfg = self.cfg
++        A, K, n = Uc.shape
++        P0 = (beta @ PVc.reshape(A * K, n).T).reshape(A, K)
++        mask = P0 <= np.maximum(cfg.delta, P0.min(0, keepdims=True) + cfg.delta)
++
++        def frozen_q(W):
++            Q = (W @ Uc.reshape(A * K, n).T).reshape(W.shape[0], A, K)
++            return np.where(mask[None], Q, -1e9)
++
++        x, wx = GH5_X, GH5_W
++        nC, nM, nJ, nX = len(cand), len(ms), len(J), len(x)
++        sc = s[0][None, :] / np.sqrt(ms)[:, None]
++        sc_rows = np.repeat(sc, nJ * nX, axis=0)
++        lb0 = np.log(beta)[None, :]
++        EVf = np.empty((nC, nM))
++        if tau is not None:
++            cJ = self._pos_live(live)[J]
++            cR = np.tile(np.repeat(cJ, nX), nM)
++            onehot = np.eye(len(live))[cJ]
++            a0 = frozen_q(beta[None, :]).argmax(1)
++            V0c = self._truth_value(np.repeat(a0, len(cR), 0), Uc, cR)
++            EVtf = np.empty((nC, nM))
++        for ci, a in enumerate(cand):
++            y = (mu[a][None, J, None] + sc[:, J, None] * x[None, None, :])
++            ll = student_t_logpdf(y.reshape(-1)[:, None] - mu[a][None, :], sc_rows)
++            mx = ll.max(1, keepdims=True)
++            Lc = np.log(np.exp(ll - mx) @ Mw.T + 1e-300) + mx
++            lb = lb0 + self.nb.eta * Lc
++            B2 = np.exp(lb - logsumexp(lb, axis=1, keepdims=True))
++            Q = frozen_q(B2)
++            Vb = (CTX_STEPS * Q.max(1).sum(1)).reshape(nM, nJ, nX)
++            EVf[ci] = np.einsum("mjx,j,x->m", Vb, pj, wx)
++            if tau is not None:
++                gt = (self._truth_value(Q.argmax(1), Uc, cR) - V0c).reshape(nM, nJ, nX)
++                Gc = np.einsum("mjx,j,x,jc->mc", gt, pj, wx, onehot)
++                EVtf[ci] = (Gc if cfg.fl_signed else np.maximum(Gc, 0.0)) @ tau
++        V0f = float(CTX_STEPS * frozen_q(beta[None, :]).max(1).sum(1)[0])
++        if tau is None:
++            voif = self._h_eff * self.kappa * np.maximum(EVf - V0f, 0.0)
++        else:
++            voif = self.kappa * EVtf
++        scoref = base[cand][:, None] + voif / ms[None, :] - pen
++        cf = np.unravel_index(int(np.argmax(scoref)), scoref.shape)
++        evpi = self._evpi(beta, Uc, PVc)
++        g, gf = EV - V0, EVf - V0f
++        self._fs_log = getattr(self, "_fs_log", [])
++        self._fs_log.append({
++            "t": self.t, "evpi": evpi, "n": int(g.size),
++            "min_gain": float(g.min()), "min_gain_frozen": float(gf.min()),
++            "n_negative": int((g < -1e-9).sum()), "n_negative_frozen": int((gf < -1e-9).sum()),
++            "max_over_evpi": float((g - evpi).max()), "max_over_evpi_frozen": float((gf - evpi).max()),
++            "max_gain": float(g.max()), "voi_max": float(voi.max()), "voi_max_frozen": float(voif.max()),
++            "choice": [int(cand[choice[0]]), int(ms[choice[1]])],
++            "choice_frozen": [int(cand[cf[0]]), int(ms[cf[1]])],
++            "probe": bool(choice[0] != 0), "probe_frozen": bool(cf[0] != 0)})
++
++    def _switch_matrix(self, A):
++        if getattr(self, "_SW", None) is None or self._SW.shape[0] != A:
++            self._SW = np.stack([mech.switch_cost_vec(p) for p in range(A)])
++        return self._SW
++
++    def _rollout_action(self, w, live, beta, Mw, U, PV, hour, prev, cand,
++                        a_greedy, base, s_in):
++        """Comparator: approximate dual control by Bayes-adaptive rollouts.
++
++        Every candidate (action a, length m), and continuing greedily, is
++        valued by Monte Carlo: truths are drawn from the posterior (stratified
++        by structure, as for the free-learning horizon); the candidate is
++        applied for m steps of the current two-hour context; greedy control
++        then continues with the agent's own Bayesian update (tempered
++        Student-t likelihood, change hazard, safety filter, dwell-amortised
++        switching) for rd_days days at the resolution of the twelve contexts.
++        The candidate with the highest mean simulated return, net of
++        reconfiguration, is taken; candidates share their random numbers.
++        This values information directly by its effect on future return under
++        continued learning -- the quantity the learning-aware value of
++        information approximates by its decomposition into per-structure
++        gains and free-learning horizons."""
++        cfg = self.cfg
++        MU, S = self._MU
++        A, K, n = U.shape
++        R = cfg.rd_truths
++        sim = np.flatnonzero(beta >= cfg.fl_min_mass)
++        if len(sim) == 0:
++            return a_greedy, 1
++        u = (np.arange(R) + 0.5) / R
++        J = np.empty((len(sim), R), int)
++        for i, c in enumerate(sim):
++            cw = np.cumsum(Mw[c])
++            J[i] = np.minimum(np.searchsorted(cw, u * cw[-1]), n - 1)
++        J = J.ravel()
++        wJ = np.repeat(beta[sim], R)
++        wJ = wJ / wJ.sum()
++        nR = len(J)
++        rr = np.arange(nR)
++        UJ = U[:, :, J]                                       # (A, K, nR)
++        Ut = np.ascontiguousarray(U.transpose(1, 2, 0))       # (K, n, A)
++        PVt = np.ascontiguousarray(PV.transpose(1, 2, 0))
++        logS = np.log(S)
++        hb = 1.0 - (1.0 - cfg.hazard_net) ** CTX_STEPS
++        lp = -np.log(self.nb.n)
++        k0 = int(hour // 2) % K
++        nb_ = K * cfg.rd_days
++        SW = self._switch_matrix(A)
++        Z = self._fl_rng.standard_normal((nR, nb_, cfg.fl_obs))
++        Z1 = self._fl_rng.standard_normal((nR, cfg.fl_obs))
++        logw0 = np.log(np.maximum(w, 1e-300))
++        p0 = int(prev) if prev is not None else int(a_greedy)
++
++        def update(logW, a, k, z, steps):
++            nobs = z.shape[1]
++            y = MU[a, k, J][:, None] + S[J][:, None] * z
++            zz = (y[:, :, None] - MU[a, k, :][:, None, :]) / S[None, None, :]
++            ll = -(2.5 * np.log1p(0.25 * zz * zz).sum(1)
++                   + nobs * logS[None, :]) * (steps / nobs)
++            logW = logW + self.nb.eta * ll
++            return logW - logsumexp(logW, axis=1, keepdims=True)
++
++        def value(a_c, m):
++            logW = np.repeat(logw0[None, :], nR, 0)
++            prevs = np.full(nR, p0)
++            tot = np.zeros(nR)
++            for b in range(nb_):
++                k = (k0 + b) % K
++                steps = CTX_STEPS
++                if b == 0 and a_c is not None:
++                    ac = np.full(nR, a_c)
++                    tot += m * UJ[a_c, k, rr] - SW[prevs, ac]
++                    logW = update(logW, ac, k, Z1[:, :min(m, cfg.fl_obs)], m)
++                    prevs = ac
++                    steps = CTX_STEPS - m
++                if steps > 0:
++                    Wb = np.exp(logW)
++                    Q = Wb @ Ut[k] - SW[prevs] / cfg.dwell
++                    if cfg.use_safety:
++                        P = Wb @ PVt[k]
++                        lim = np.maximum(cfg.delta, P.min(1, keepdims=True) + cfg.delta)
++                        Q = np.where(P <= lim, Q, -1e9)
++                    a = Q.argmax(1)
++                    tot += steps * UJ[a, k, rr] - SW[prevs, a]
++                    logW = update(logW, a, k, Z[:, b, :], steps)
++                    prevs = a
++                logW = np.logaddexp(np.log1p(-hb) + logW, np.log(hb) + lp)
++                logW -= logsumexp(logW, axis=1, keepdims=True)
++            return float(wJ @ tot)
++
++        if len(cand) > cfg.n_cand:
++            cand = cand[np.argsort(-(base - s_in)[cand])[: cfg.n_cand]]
++        v0 = value(None, 1)
++        probe = getattr(self, "_rd_probe", None)
++        if probe is not None:
++            # analysis only: the direct value of a given probe at this state
++            self._rd_probe_value = float(value(int(probe[0]), int(probe[1])) - v0)
++            return int(a_greedy), 1
++        best, a_best, m_best = v0, int(a_greedy), 1
++        for a in cand:
++            for m in cfg.kg_m:
++                v = value(int(a), int(m))
++                if v > best + 1e-9:
++                    best, a_best, m_best = v, int(a), int(m)
++        self._last_pred = float(best - v0)
++        self._last_net = float(best - v0)
++        self._last_voi = float(best - v0)
++        return a_best, m_best
+ 
+     def _durability(self, beta, hazard):
+         """How long (in days) resolving the current structural uncertainty
+@@ -692,7 +895,7 @@
+                 # beta_c * g_c for every structure c: the expected gain when
+                 # c holds, weighted by its posterior mass
+                 Gc = np.einsum("mjx,j,x,jc->mc", gt, pj, wx, onehot)
+-                EVt[ci] = np.maximum(Gc, 0.0) @ tau
++                EVt[ci] = (Gc if cfg.fl_signed else np.maximum(Gc, 0.0)) @ tau
+         gain = np.maximum(EV - V0, 0.0)                              # (C, M)
+         if tau is None:
+             voi = self._h_eff * self.kappa * gain
+@@ -711,7 +914,15 @@
+         pen[0, :] = s_in[a_greedy] / cfg.dwell
+         score = base[cand][:, None] + voi / ms[None, :] - pen
+         c, mi = np.unravel_index(int(np.argmax(score)), score.shape)
++        if cfg.fs_audit:
++            self._audit_frozen_sets(w, beta, Mw, Uc, PVc, mu, s, cand, ms, J, pj,
++                                    V0, EV, voi, pen, base, live, tau, (c, mi))
+         self._last_pred = float(gain[c, mi])
++        # instrumentation only (added after both iterations were frozen; it
++        # changes no decision): the chosen probe's predicted value, gross and
++        # net of what it costs relative to staying greedy for the same m steps
++        self._last_voi = float(voi[c, mi])
++        self._last_net = float((score[c, mi] - score[0, mi]) * ms[mi])
+         return int(cand[c]), int(ms[mi])
+ 
+     def _identify_action(self, idx, w, mu, s, ok, a_greedy):
+@@ -823,7 +1034,7 @@
+             g[c] = float(np.mean(
+                 self._truth_value(self._greedy_actions(Bn, Uc, PVc), Uc, cc)
+                 - self._truth_value(a0, Uc, cc)))
+-        vn = float(beta @ (np.maximum(g, 0.0) * tau))
++        vn = float(beta @ ((g if cfg.fl_signed else np.maximum(g, 0.0)) * tau))
+         tw = self.tb.w
+         tau_t, Ucl, cls_pos = self._free_horizon_th(h_t, at_start=True,
+                                                     R=cfg.fl_ask_truths)
+@@ -838,8 +1049,8 @@
+                 b = ltw + ex.loglik("D", z["D"], fac_th)
+                 s1[m] = int(np.argmax(np.exp(b - logsumexp(b)) @ Uth))
+             r = cls_pos[d]
+-            vt += bt[d] * tau_t[r] * max(0.0, float(np.mean(Ucl[r, s1]
+-                                                            - Ucl[r, s0])))
++            gd = float(np.mean(Ucl[r, s1] - Ucl[r, s0]))
++            vt += bt[d] * tau_t[r] * (gd if cfg.fl_signed else max(0.0, gd))
+         self._ask_parts.update({"net": vn, "th": vt, "tau": tau.tolist(),
+                                 "gain": g.tolist(), "beta": beta.tolist(),
+                                 "tau_th": tau_t.tolist()})
+@@ -967,7 +1178,7 @@
+             rho = float(np.clip(reg1[m].sum() / den, 0.0, 1.0)) if den > 1e-9 else 1.0
+             tau[c] = ((min(1.0, h_th) if at_start else 0.0)
+                       + rho * max(0.0, h_th - 1.0))
+-        return tau, Ucl, cls_pos
++        return self._scale_tau(tau, np.arange(len(live)), h_th), Ucl, cls_pos
+ 
+     def set_forecast(self, forecast):
+         self.forecast = np.asarray(forecast, float)
+@@ -1065,7 +1276,7 @@
+             s_0 = int(np.argmax(beta[live] @ Uc))
+             g = Uc[ct, s_b] - Uc[ct, s_0]
+             G = np.bincount(ct, weights=g, minlength=len(live)) / len(g)
+-            voi = float(np.maximum(G, 0.0) @ tau_t)
++            voi = float((G if self.cfg.fl_signed else np.maximum(G, 0.0)) @ tau_t)
+         else:
+             voi = h_th * (float(np.mean(np.max(B2 @ Uc, axis=1)))
+                           - float(np.max(beta[live] @ Uc)))
+--- frozen/test2/causlm/probe/plants.py
++++ causlm/probe/plants.py
+@@ -114,6 +114,27 @@
+     net = sample_net_params(rng, A, B, C)
+     th = sample_th_params(rng, D)
+     scenario = scenario or {}
++    if scenario.get("widen"):
++        # Prior-generator mismatch: every continuous parameter is redrawn
++        # from its range widened by `widen` times its width on each side, so
++        # that a large share of plants lie outside the support the agent's
++        # particles are drawn from. A dedicated stream keeps everything else
++        # as in the nominal plant; signs and orders of magnitude are kept.
++        f = float(scenario["widen"])
++        rw = np.random.default_rng(seed + 53)
++        for P, specs in ((net, (NET_RANGES[("C", C)], NET_RANGES[("B", B)],
++                                NET_RANGES[("A", A)], NET_COMMON)),
++                         (th, (TH_RANGES[D], TH_COMMON))):
++            for spec in specs:
++                for k, (lo, hi) in spec.items():
++                    if hi <= lo:
++                        continue
++                    a, b = lo - f * (hi - lo), hi + f * (hi - lo)
++                    if lo > 0:
++                        a = max(a, lo / 2.0)
++                    if hi < 0:
++                        b = min(b, hi / 2.0)
++                    P[k] = float(rw.uniform(a, b))
+     if "sigma" in scenario:
+         # draw from a dedicated stream so the other parameters are unchanged
+         net["sigma"] = float(np.random.default_rng(seed + 31).uniform(
+--- frozen/test2/experiments/cp_e1_commission.py
++++ experiments/cp_e1_commission.py
+@@ -45,6 +45,10 @@
+                               "burst": (2.0, 4.0)}, "switch": (1.5, 0.2)},
+     "poor_docs": {"notes": "poor_docs"},
+     "shift": {"regime": {"day": 3}},
++    # prior-generator mismatch (fourth test set only): every continuous plant
++    # parameter drawn from a range twice as wide as the agent's prior
++    "mismatch": {"plant": {"widen": 0.5}},
++    "mismatch_lpwan": {"plant": {"widen": 0.5}, "switch": (1.5, 0.2)},
+ }
+ 
+ 
+@@ -65,7 +69,9 @@
+                 merged.setdefault(k, {}).update(d["outputs"][k])
+         # ... plus the notes of the fresh out-of-library test plants, and of
+         # the second test set (cp_expert_score_test2.py)
+-        extra = [CP_RESULTS / f"expert_outputs_test2_{NOTES}.json"]
++        extra = [CP_RESULTS / f"expert_outputs_test2_{NOTES}.json",
++                 CP_RESULTS / f"expert_outputs_test3_{NOTES}.json",
++                 CP_RESULTS / f"expert_outputs_test4_{NOTES}.json"]
+         if NOTES == "nominal":
+             extra += [CP_RESULTS / "expert_outputs_ool_test.json",
+                       CP_RESULTS / "expert_outputs_ool_test2.json"]
+@@ -86,6 +92,15 @@
+ def make_agent(method, spec, key, seed):
+     """Factory for every method in the study."""
+     ex_name = "slm-0.5b-lora"
++    if method.endswith("-fleet"):
++        # the same model output, read through the fleet-calibrated expert
++        # (cp_build_fleet_expert.py): temperatures and logit bank refitted on
++        # interventional labels from earlier sites
++        ag, z = make_agent(method[:-len("-fleet")], spec, key, seed)
++        ag.expert = load_expert(ex_name + "-fleet")
++        assert ag.expert is not None, "run cp_build_fleet_expert.py first"
++        ag.name = method
++        return ag, z
+     if method == "oracle":
+         return OracleAgent(spec, seed=seed), None
+     if method == "fallback":
+@@ -159,6 +174,27 @@
+         return CauProbeAgent(ProbeConfig(**kw), seed=seed,
+                              expert=load_expert(ex_name),
+                              name=method), expert_outputs()[key][ex_name]
++    if method.startswith("dual-rollout"):
++        # comparator: approximate dual control by Bayes-adaptive rollouts on
++        # the same belief, safety filter, screen and probe execution as
++        # CauProbe-2; only the valuation of a probe differs (direct simulated
++        # return under continued learning instead of gains x horizons).
++        # "dual-rollout+ask" also reads the notes (static valuation of the
++        # reading, which reads at any realistic price); suffix "@k=v" as above
++        base, _, over = method.partition("@")
++        kw = {"objective": "rollout", "reopen_rate": True, "probe_return": True}
++        for item in filter(None, over.split("+")):
++            if "=" not in item:
++                continue
++            k, v = item.split("=")
++            kw[k] = type(getattr(ProbeConfig, k))(v)
++        if base == "dual-rollout+ask":
++            return CauProbeAgent(ProbeConfig(**kw), seed=seed,
++                                 expert=load_expert(ex_name),
++                                 name=method), expert_outputs()[key][ex_name]
++        assert base == "dual-rollout", method
++        return CauProbeAgent(ProbeConfig(use_ask=False, **kw), seed=seed,
++                             name=method), None
+     if method.startswith("cauprobe-expert:"):
+         en = method.split(":", 1)[1]
+         return CauProbeAgent(ProbeConfig(), seed=seed, expert=load_expert(en),
+@@ -241,6 +277,14 @@
+         # the second fresh test set (second iteration frozen beforehand)
+         from cp_common import TEST2_PLANTS
+         plants = [(s, c, None) for s, c in TEST2_PLANTS]
++    elif args.plants == "test3":
++        # the third fresh test set (fleet calibration frozen beforehand)
++        from cp_common import TEST3_PLANTS
++        plants = [(s, c, None) for s, c in TEST3_PLANTS]
++    elif args.plants == "test4":
++        # the fourth fresh test set (prior-generator mismatch)
++        from cp_common import TEST4_PLANTS
++        plants = [(s, c, None) for s, c in TEST4_PLANTS]
+     elif args.plants == "ool2":
+         from cp_common import OOL_TEST2_PLANTS
+         plants = [(s, c, k) for s, c, k in OOL_TEST2_PLANTS]
