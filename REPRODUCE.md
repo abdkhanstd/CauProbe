@@ -59,9 +59,12 @@ python experiments/cp_split_tables.py     # one file per table in paper/tables/
 ```
 
 The table files in `paper/tables/` were edited by hand after splitting, for
-punctuation only (semicolons in captions and cells became commas or slashes).
-No number was changed. `cp_split_tables.py` overwrites those edits, so run it
-into a copy of `paper/` to compare.
+punctuation and layout only: semicolons in captions and cells became commas or
+slashes, `edge.tex` and `boptest.tex` use smaller type, `boptest.tex` has
+no float of its own because the manuscript sets it beside the repeated-faults
+table, and `ablation.tex`, now in the Supplementary Material, refers to the
+main paper's Table 5 by the `M-` prefix. No number was changed. `cp_split_tables.py` overwrites those edits, so
+run it into a copy of `paper/` to compare.
 
 Building the paper: compile `supplement.tex` and `main.tex` once each with
 pdflatex, run `python paper/make_bib.py` (each document's reference list, in

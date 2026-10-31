@@ -5,7 +5,8 @@ cp_figs_extra, cp_iter2, cp_audit_summary), but on axes laid out at final
 print size: each panel has the same box (axes plus fixed margins), text is
 7 pt, legends move to a panel of their own, and each panel is saved as its own
 PDF (<figure>_a.pdf, <figure>_b.pdf, ..., <figure>_leg.pdf) in paper/figs.
-The paper sets them two or three to a row at 0.32 of the text width.
+The paper sets them three to a row at their natural size, 0.26 of the text
+width (wide panels 0.52).
 
     python experiments/cp_figs_small.py
 """
@@ -36,8 +37,11 @@ plt.rcParams.update({
     "xtick.major.size": 2.5, "ytick.major.size": 2.5, "lines.linewidth": 1.0,
     "axes.spines.top": False, "axes.spines.right": False, "pdf.fonttype": 42})
 
-# panel geometry in inches: axes width/height and the margins around them
-PANEL = dict(aw=1.62, ah=1.30, L=0.48, R=0.08, B=0.40, T=0.22)
+# panel geometry in inches: axes width/height and the margins around them.
+# A panel is 1.68 in wide, 0.26 of the 6.48 in text width, so the paper sets it
+# at its natural size (\pw = 0.26\textwidth); wide panels are 0.52.
+PANEL = dict(aw=1.20, ah=0.95, L=0.42, R=0.06, B=0.36, T=0.18)
+WIDE = 0.52 * 6.476 - 0.48  # axes width of a 0.52-textwidth panel
 SPEC: dict = {}
 # axis labels that are too long for a small panel
 SHORT = {
@@ -46,6 +50,8 @@ SHORT = {
         "return lost vs full CauProbe (95% CI)",
     "price of one expert call (reward units)": "price per expert call",
 }
+WRAP = {"noisy+LPWAN": "noisy+\nLPWAN", "poor docs": "poor\ndocs",
+        "struct. change": "struct.\nchange"}
 
 
 def _geometry():
@@ -94,12 +100,21 @@ def save(fig, name):
         if name in TEST1 and name == "cp_fig4_ablation":
             ax.set_yticks(ax.get_yticks())
             ax.set_yticklabels([_v1(t.get_text(), name) for t in ax.get_yticklabels()])
+        ticks = [t.get_text() for t in ax.get_xticklabels()]
+        if "scenarios" in name and any(t in WRAP for t in ticks):
+            # scenario names on two lines, so that neighbours do not run together
+            ax.set_xticks(ax.get_xticks())
+            ax.set_xticklabels([WRAP.get(t, t) for t in ticks])
+        if any(re.fullmatch(r"A\dB\dC\d", t) for t in ticks):
+            # mechanism combinations: upright text does not fit eight to a panel
+            ax.tick_params(axis="x", labelrotation=90, labelsize=6)
     for i in range(n):
         fig.savefig(FIGS / f"{name}_{'abcdef'[i]}.pdf",
                     bbox_inches=Bbox([[i * pw, 0], [(i + 1) * pw, ph]]))
     if handles:
-        _, pw1, ph1 = _geometry()
-        lf = plt.figure(figsize=(2.18, ph1))
+        _, _, ph1 = _geometry()
+        # legends take one ordinary panel's width, also beside a wide panel
+        lf = plt.figure(figsize=(PANEL["L"] + PANEL["aw"] + PANEL["R"], ph1))
         lf.legend(handles, labels, loc="center", frameon=False, ncol=1,
                   handlelength=1.8, borderaxespad=0)
         lf.savefig(FIGS / f"{name}_leg.pdf")
@@ -136,14 +151,127 @@ def fig_audit(save_fn):
     save_fn(fig, "cp_fig11_audit")
 
 
+def fig_pooled(save_fn):
+    """Pooled second and third test sets (Table 8, cp_pooled.py): the upper
+    tail of the gap to the known-plant reference over the plant-scenarios, and
+    the share of runs ending on a wrong network mechanism in each set."""
+    import cp_pooled as PO
+    D, W = PO.load()
+    ms = [("cauprobe-v2", "#1f5fa8", "CauProbe-2"),
+          ("cauprobe-noprobe", "#8fb7e8", "expert + greedy"),
+          ("greedy", "#7f7f7f", "greedy (same belief)")]
+    keys = [k for k, v in D.items() if all(m in v for m, _, _ in ms)]
+    runs = set.intersection(*(set(W[m]) for m, _, _ in ms))
+    fig, axes = plt.subplots(1, 2)
+    q = (np.arange(len(keys)) + 0.5) / len(keys)
+    tail = q >= 0.75
+    for m, col, lab in ms:
+        g = np.sort([D[k][m]["gap"] for k in keys])
+        axes[0].plot(q[tail], g[tail], color=col, lw=1.2, label=lab)
+    axes[0].axvspan(0.9, 1.0, color="k", alpha=0.07, lw=0)
+    axes[0].set_xlim(0.75, 1.0)
+    axes[0].set_xticks([0.8, 0.9, 1.0])
+    axes[0].set_xticklabels(["0.8", "0.9", "1"])
+    axes[0].set_xlabel("quantile of plant-scenarios")
+    axes[0].set_ylabel("gap to reference (14 days)")
+    sets = (("test2", "test 2"), ("test3", "test 3"))
+    w = 0.27
+    for j, (m, col, _) in enumerate(ms):
+        for i, (st, _) in enumerate(sets):
+            v = [np.mean(W[m][k]) > 0.5 for k in runs if k[0] == st]
+            axes[1].bar(i + (j - 1) * w, 100 * np.mean(v), w, color=col)
+    axes[1].set_xticks(range(len(sets)))
+    axes[1].set_xticklabels([s for _, s in sets])
+    axes[1].set_ylabel("runs on a wrong mechanism (%)")
+    save_fn(fig, "cp_fig12_pooled")
+
+
+def fig_fleetcal(save_fn):
+    """Fleet calibration on the 48 second-test sites, nominal notes
+    (cp_fleetcal.py): reliability of the expert with its training-vocabulary
+    temperatures and with temperatures refitted, before each site, to the final
+    posteriors of all earlier CauProbe-2 sites; and calibration error against
+    the number of earlier sites, by the source of the labels."""
+    import cp_fleetcal as FC
+    from causlm.probe.expert import (FACTORS, ExpertModel, expected_calibration_error,
+                                     fit_temperature)
+    z, lab = FC.logits("nominal"), FC.labels("nominal")
+    order = [s for s, _ in FC.HELDOUT_PLANTS + FC.TEST_PLANTS + FC.TEST2_PLANTS]
+    order = [s for s in order if s in z and s in lab]
+    evalset = [s for s, _ in FC.TEST2_PLANTS if s in z and s in lab]
+    base = ExpertModel.from_json(CP_RESULTS / "experts" / f"{FC.EXP}.json")
+
+    def probs(tau, s):
+        return [1 / (1 + np.exp(-tau[F] * z[s][F])) for F in FACTORS]
+
+    def truth(s):
+        return [lab[s]["oracle"][F] for F in FACTORS]
+
+    P0 = sum((probs(base.tau, s) for s in evalset), [])
+    P1, Y1 = [], []
+    for s in evalset:
+        hist = [h for h in order[:order.index(s)] if "cauprobe-v2" in lab[h]]
+        if len(hist) < 8:
+            continue
+        tau = {F: fit_temperature([z[h][F] for h in hist],
+                                  [lab[h]["cauprobe-v2"][F] for h in hist]) for F in FACTORS}
+        P1 += probs(tau, s)
+        Y1 += truth(s)
+    Y0 = sum((truth(s) for s in evalset), [])
+    fig, axes = plt.subplots(1, 2)
+    ax = axes[0]
+    edges = np.linspace(0, 1, 11)
+    for P, Y, col, lab_ in ((P0, Y0, "#d1781e", "training vocabulary"),
+                            (P1, Y1, "#1f5fa8", "fleet, CauProbe-2 labels")):
+        P, Y = np.asarray(P), np.asarray(Y, float)
+        ece = expected_calibration_error(P, Y)
+        idx = np.clip(np.digitize(P, edges) - 1, 0, 9)
+        xs, ys, ns = [], [], []
+        for b in range(10):
+            if (idx == b).sum() >= 5:
+                xs.append(P[idx == b].mean())
+                ys.append(Y[idx == b].mean())
+                ns.append((idx == b).sum())
+        ax.plot(xs, ys, "-", color=col, lw=1.0, label=lab_)
+        ax.scatter(xs, ys, s=4 + 40 * np.asarray(ns) / len(P), color=col, lw=0, zorder=3)
+        print(f"  {lab_}: ECE {ece:.3f} on {len(P)} answers")
+    ax.plot([0, 1], [0, 1], color="#888", lw=0.8, ls="--")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_xticks([0, 0.5, 1])
+    ax.set_xticklabels(["0", "0.5", "1"])
+    ax.set_xlabel("predicted probability")
+    ax.set_ylabel("observed frequency")
+    ax = axes[1]
+    d = json.loads((CP_RESULTS / "fleetcal.json").read_text())["nominal"]
+    for src, col, ls, mk, lab_ in (
+            ("cauprobe", "#5b8fd6", "-", "o", "CauProbe-1 labels"),
+            ("oracle", "k", ":", None, "true mechanisms"),
+            ("greedy", "#7f7f7f", "-", "s", "greedy labels"),
+            ("cauprobe-noprobe", "#8fb7e8", "-", "^", "expert + greedy labels")):
+        pts = d["by_fleet_size"][src]
+        ax.plot([p["n"] for p in pts], [p["ece"] for p in pts], ls=ls, marker=mk, ms=3,
+                color=col, lw=1.0, label=lab_)
+    ax.axhline(d["calibration"]["train-vocab"]["ece"], color="#d1781e", lw=0.8, ls="--")
+    ax.set_xscale("log", base=2)
+    ax.set_xticks([4, 8, 16, 32, 64])
+    ax.set_xticklabels(["4", "8", "16", "32", "64"])
+    ax.set_ylim(0, 0.2)
+    ax.set_xlabel("earlier sites in the fleet")
+    ax.set_ylabel("calibration error (ECE)")
+    save_fn(fig, "cp_fig13_fleetcal")
+
+
 JOBS = [
+    (lambda: fig_pooled(save), {}),
+    (lambda: fig_fleetcal(save), {}),
     (lambda: MF.fig_learning_curve(), {}),
-    (lambda: MF.fig_scenarios(), {"aw": 3.80}),
-    (lambda: XF.fig_ablation(save), {"aw": 1.75, "ah": 2.05, "L": 1.95}),
-    (lambda: XF.fig_tail(save), {"B": 0.52}),
+    (lambda: MF.fig_scenarios(), {"aw": WIDE, "B": 0.46}),
+    (lambda: XF.fig_ablation(save), {"aw": WIDE - 1.48, "ah": 1.75, "L": 1.90}),
+    (lambda: XF.fig_tail(save), {"B": 0.50}),
     (lambda: XF.fig_probe_timing(save), {}),
     (lambda: XF.fig_price(save), {}),
-    (lambda: I2.fig_scenarios(save, I2.scen_summary()), {"aw": 3.80}),
+    (lambda: I2.fig_scenarios(save, I2.scen_summary()), {"aw": WIDE, "B": 0.46}),
     (lambda: I2.fig_price(save, I2.price_rows(), I2.voi_ask()), {}),
     (lambda: fig_audit(save), {}),
 ]
