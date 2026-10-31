@@ -110,7 +110,12 @@ def compare(D, a, b, rng):
     return obs
 
 
-def lockin(W, a, b):
+def lockin(W, a, b, rng=None):
+    """Lock-in is counted per run (576 runs: the nominal scenario has two runs
+    per plant), unlike the return statistics, which average the runs of a
+    plant-scenario first (480 plant-scenarios). The exact McNemar test treats
+    runs as independent pairs. The cluster bootstrap of the rate difference
+    resamples plants within each set and keeps all of a plant's runs."""
     ka = {k: np.mean(v) > 0.5 for k, v in W[a].items()}
     kb = {k: np.mean(v) > 0.5 for k, v in W[b].items()}
     ks = sorted(set(ka) & set(kb))
@@ -118,8 +123,26 @@ def lockin(W, a, b):
     n01 = sum(1 for k in ks if ka[k] and not kb[k])
     n = n10 + n01
     p = min(1.0, 2 * sum(comb(n, i) for i in range(min(n10, n01) + 1)) / 2 ** n) if n else 1.0
-    return {"rate": (float(np.mean([ka[k] for k in ks])), float(np.mean([kb[k] for k in ks]))),
-            "discordant": (n10, n01), "mcnemar_p": p, "n_runs": len(ks)}
+    out = {"rate": (float(np.mean([ka[k] for k in ks])), float(np.mean([kb[k] for k in ks]))),
+           "count": (int(sum(ka[k] for k in ks)), int(sum(kb[k] for k in ks))),
+           "discordant": (n10, n01), "mcnemar_p": p, "n_runs": len(ks),
+           "n_plants": len({(k[0], k[2] // 10) for k in ks})}
+    if rng is not None:
+        # per plant: (lock-ins of a, lock-ins of b, runs), grouped by test set
+        per = defaultdict(lambda: np.zeros(3))
+        for k in ks:
+            per[(k[0], k[2] // 10)] += (ka[k], kb[k], 1)
+        sets = defaultdict(list)
+        for (st, _), v in per.items():
+            sets[st].append(v)
+        sets = [np.array(v) for v in sets.values()]
+        bs = []
+        for _ in range(B):
+            tot = sum(s[rng.integers(0, len(s), len(s))].sum(0) for s in sets)
+            bs.append((tot[1] - tot[0]) / tot[2])
+        out["reduction_ci95"] = (float(np.percentile(bs, 2.5)), float(np.percentile(bs, 97.5)))
+        out["reduction_p_le0"] = float((np.asarray(bs) <= 0).mean())
+    return out
 
 
 def noninferiority(D, rng):
@@ -167,32 +190,45 @@ def main():
         print(json.dumps(ni, indent=1, default=float))
         return
     out = {}
+    rng_lock = np.random.default_rng(1)  # separate stream: return statistics unchanged
     for a, b in (("cauprobe-v2", "cauprobe-noprobe"), ("cauprobe-v2", "greedy"),
                  ("cauprobe-noprobe", "greedy")):
         out[f"{a}|{b}"] = compare(D, a, b, rng)
-        out[f"{a}|{b}"]["lockin"] = lockin(W, a, b)
+        out[f"{a}|{b}"]["lockin"] = lockin(W, a, b, rng_lock)
         print(a, b, json.dumps(out[f"{a}|{b}"], default=float))
     (CP_RESULTS / "pooled.json").write_text(json.dumps(out, indent=1, default=float))
     table(out)
 
 
 def table(o):
+    import re
     nm = {"cauprobe-v2": r"\ours-2", "cauprobe-noprobe": "expert + greedy",
           "greedy": "greedy"}
+    n_ps = next(iter(o.values()))["n"]
+    n_runs = next(iter(o.values()))["lockin"]["n_runs"]
     L = [r"\begin{table*}[t]", r"\centering",
          r"\caption{Pooled over the two test sets on which \ours-2 was never developed: "
          r"the second (six scenarios) and the third (four scenarios: nominal, poor "
-         r"documentation, LPWAN, noisy), 48 plants each, ten scenario sets, 480 "
-         r"plant-scenarios, all with the original (training-vocabulary) expert; "
-         r"cluster bootstrap over plants. \emph{Mean}: "
+         r"documentation, LPWAN, noisy), 48 plants each, all with the original "
+         r"(training-vocabulary) expert. This gives ten scenario sets, "
+         f"{n_ps} plant-scenarios and {n_runs} runs, because the nominal scenario "
+         r"has two runs per plant (Section~\ref{sec:protocol}). "
+         r"\emph{Two denominators.} The mean, CVaR and severe rows are computed over "
+         f"the {n_ps} plant-scenarios, each weighted equally, with the two nominal "
+         r"runs of a plant averaged first. The lock-in rows are computed over the "
+         f"{n_runs} runs, each weighted equally. Intervals come from a cluster "
+         r"bootstrap that resamples plants within each test set and keeps all of a "
+         r"plant's scenarios and runs together. \emph{Mean}: "
          r"paired difference in 14-day return, first minus second, with its 95\% "
-         r"and 90\% CIs (no equivalence margin is implied; see text). "
+         r"and 90\% CIs (no equivalence margin is implied, see text). "
          r"\emph{CVaR}: mean gap to the known-plant "
          r"reference over the worst 10\% / 5\% of plant-scenarios. "
          r"\emph{Severe}: share of plant-scenarios more than 50 / 100 behind "
-         r"the reference. \emph{Lock-in}: runs ending on a wrong network "
-         r"mechanism; exact McNemar test on discordant runs. Reductions are "
-         r"second minus first, with 95\% CIs.}",
+         r"the reference. \emph{Lock-in}: share and number of runs ending on a "
+         r"wrong network mechanism. The exact McNemar test on the discordant runs "
+         r"treats runs as independent pairs, the clustered interval does not. "
+         r"Reductions are second minus first, with 95\% CIs (lock-in in "
+         r"percentage points).}",
          r"\label{tab:pooled}", r"\footnotesize", r"\setlength{\tabcolsep}{3pt}",
          r"\begin{tabular}{lccc}", r"\toprule",
          r" & " + " & ".join(f"{nm[k.split('|')[0]]} vs {nm[k.split('|')[1]]}" for k in o)
@@ -201,20 +237,35 @@ def table(o):
     def f(x, nd=1):
         return f"{x:+.{nd}f}"
 
+    def lk(v):
+        c, n = v["lockin"]["count"], v["lockin"]["n_runs"]
+        return (f"{100*v['lockin']['rate'][0]:.1f}\\% / {100*v['lockin']['rate'][1]:.1f}\\%"
+                f" ({c[0]} / {c[1]} of {n})")
+
+    def lkr(v):
+        r, ci = v["lockin"]["rate"], v["lockin"]["reduction_ci95"]
+        return f"{f(100*(r[1]-r[0]) + 1e-9)} [{f(100*ci[0] + 1e-9)}, {f(100*ci[1] + 1e-9)}]"  # half-up
+
     rows = [("mean difference", lambda v: f"{f(v['mean'])} [{f(v['mean_ci95'][0])}, {f(v['mean_ci95'][1])}]"),
             ("\\quad 90\\% CI", lambda v: f"[{f(v['mean_ci90'][0])}, {f(v['mean_ci90'][1])}]"),
-            ("CVaR$_{10}$ (first; second)", lambda v: f"{v['cvar10'][0]:.0f}; {v['cvar10'][1]:.0f}"),
+            ("CVaR$_{10}$ (first / second)", lambda v: f"{v['cvar10'][0]:.0f} / {v['cvar10'][1]:.0f}"),
             ("\\quad reduction [95\\% CI]", lambda v: f"{f(v['cvar10'][1]-v['cvar10'][0],0)} [{f(v['cvar10_reduction_ci95'][0],0)}, {f(v['cvar10_reduction_ci95'][1],0)}]"),
-            ("CVaR$_{5}$ (first; second)", lambda v: f"{v['cvar5'][0]:.0f}; {v['cvar5'][1]:.0f}"),
+            ("CVaR$_{5}$ (first / second)", lambda v: f"{v['cvar5'][0]:.0f} / {v['cvar5'][1]:.0f}"),
             ("\\quad reduction [95\\% CI]", lambda v: f"{f(v['cvar5'][1]-v['cvar5'][0],0)} [{f(v['cvar5_reduction_ci95'][0],0)}, {f(v['cvar5_reduction_ci95'][1],0)}]"),
-            ("severe $>$50 (first; second)", lambda v: f"{100*v['severe50'][0]:.1f}\\%; {100*v['severe50'][1]:.1f}\\%"),
-            ("severe $>$100 (first; second)", lambda v: f"{100*v['severe100'][0]:.1f}\\%; {100*v['severe100'][1]:.1f}\\%"),
-            ("lock-in (first; second)", lambda v: f"{100*v['lockin']['rate'][0]:.1f}\\%; {100*v['lockin']['rate'][1]:.1f}\\%"),
+            ("severe $>$50 (first / second)", lambda v: f"{100*v['severe50'][0]:.1f}\\% / {100*v['severe50'][1]:.1f}\\%"),
+            ("severe $>$100 (first / second)", lambda v: f"{100*v['severe100'][0]:.1f}\\% / {100*v['severe100'][1]:.1f}\\%"),
+            (f"lock-in, runs (first / second)", lk),
+            ("\\quad reduction [95\\% CI], pp", lkr),
+            ("\\quad discordant runs", lambda v: f"{v['lockin']['discordant'][0]} / {v['lockin']['discordant'][1]}"),
             ("\\quad McNemar $p$", lambda v: f"{v['lockin']['mcnemar_p']:.2g}")]
     for lab, fn in rows:
         L.append(lab + " & " + " & ".join(fn(v) for v in o.values()) + r" \\")
     L += [r"\bottomrule", r"\end{tabular}", r"\end{table*}", ""]
-    (ROOT / "paper" / "tables_cp_pooled.tex").write_text("\n".join(L))
+    tex = "\n".join(L)
+    (ROOT / "paper" / "tables_cp_pooled.tex").write_text(tex, newline="\n")
+    # the manuscript's copy, with typographic minus signs (as cp_split_tables.py)
+    minus = re.compile(r"(?<=[\s\[(&])-(?=\d)")
+    (ROOT / "paper" / "tables" / "pooled.tex").write_text(minus.sub("$-$", tex), newline="\n")
 
 
 if __name__ == "__main__":

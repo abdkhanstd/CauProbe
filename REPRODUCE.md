@@ -36,11 +36,12 @@ adapter of the text expert, and the LaTeX sources.
 ```bash
 pip install -r requirements-cauprobe.txt
 python experiments/cp_make_tables.py      # tables_cp*.tex, summary.json
-python experiments/cp_make_figures.py     # figs/cp_fig*.pdf
+python experiments/cp_make_figures.py     # figs/cp_fig*.pdf (full-size versions)
+python experiments/cp_figs_small.py       # the panels the paper uses, paper/figs/cp_fig*_a.pdf, _b.pdf, _leg.pdf
 python experiments/cp_numbers.py          # numbers quoted in the text (test 1)
 python experiments/cp_iter2.py            # second iteration (test 2)
 python experiments/cp_test3.py            # fleet calibration (test 3)
-python experiments/cp_pooled.py           # pooled mean / tail / lock-in
+python experiments/cp_pooled.py           # pooled mean / tail / lock-in with plant-clustered CI (also writes paper/tables/pooled.tex)
 python experiments/cp_pooled.py --ni      # non-inferiority with the margin from test 1
 python experiments/cp_review3.py          # signed ablation, mismatch, detector
 python experiments/cp_audit_summary.py    # paired probe audit
@@ -57,10 +58,17 @@ python experiments/cp_verify_frozen.py --replay   # frozen code states
 python experiments/cp_split_tables.py     # one file per table in paper/tables/
 ```
 
+The table files in `paper/tables/` were edited by hand after splitting, for
+punctuation only (semicolons in captions and cells became commas or slashes).
+No number was changed. `cp_split_tables.py` overwrites those edits, so run it
+into a copy of `paper/` to compare.
+
 Building the paper: compile `supplement.tex` and `main.tex` once each with
 pdflatex, run `python paper/make_bib.py` (each document's reference list, in
 order of first citation), then compile both twice more; cross-references
-between the two documents use the `xr` package.
+between the two documents use the `xr` package. `python paper/make_clean.py`
+then writes `paper_clean/`, with each document as a single file and the
+cross-references resolved to numbers.
 
 Re-running the simulations themselves uses the `run_*.sh` scripts (they were
 run on a 64-core machine; a full grid takes 1–4 hours, the replicated probe
