@@ -121,6 +121,20 @@ def main():
             c_ += wc and not wr
         n = b + c_
         p = min(1.0, 2 * sum(comb(n, k) for k in range(0, min(b, c_) + 1)) / 2 ** n) if n else 1.0
+        # the same comparison with plants as the unit (a plant's runs are not
+        # independent): plants where the rival ends more runs on a wrong
+        # mechanism than CauProbe, and fewer, with an exact two-sided sign test
+        wp = defaultdict(lambda: [0, 0])
+        for s, cp in by["cauprobe"].items():
+            rv = by[rival].get(s)
+            if rv is not None:
+                wp[s // 10][0] += bool(wrong_factors(cp))
+                wp[s // 10][1] += bool(wrong_factors(rv))
+        more = sum(1 for v in wp.values() if v[1] > v[0])
+        fewer = sum(1 for v in wp.values() if v[1] < v[0])
+        ns = more + fewer
+        sp = min(1.0, 2 * sum(comb(ns, k) for k in range(0, min(more, fewer) + 1))
+                 / 2 ** ns) if ns else 1.0
         # bootstrap CI for the CVaR10 difference of per-plant gaps (paired plants)
         gp = defaultdict(lambda: defaultdict(list))
         for m in ("cauprobe", rival):
@@ -139,6 +153,8 @@ def main():
         idx = rng.integers(0, len(plants), (10000, len(plants)))
         diffs = np.array([cv(B[i]) - cv(A[i]) for i in idx])
         N[f"tail_vs:{rival}"] = {"wrong_discordant": (int(b), int(c_)), "mcnemar_p": p,
+                                 "plants_rival_more_fewer": (more, fewer),
+                                 "n_plants": len(wp), "sign_p_plants": sp,
                                  "cvar10_rival_minus_cp": float(cv(B) - cv(A)),
                                  "cvar10_ci": (float(np.percentile(diffs, 2.5)),
                                                float(np.percentile(diffs, 97.5))),

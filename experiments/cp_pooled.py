@@ -113,9 +113,12 @@ def compare(D, a, b, rng):
 def lockin(W, a, b, rng=None):
     """Lock-in is counted per run (576 runs: the nominal scenario has two runs
     per plant), unlike the return statistics, which average the runs of a
-    plant-scenario first (480 plant-scenarios). The exact McNemar test treats
-    runs as independent pairs. The cluster bootstrap of the rate difference
-    resamples plants within each set and keeps all of a plant's runs."""
+    plant-scenario first (480 plant-scenarios). A plant's runs are not
+    independent, so inference uses plants as the unit: the cluster bootstrap
+    of the rate difference resamples plants within each set and keeps all of a
+    plant's runs, and the exact sign test compares, plant by plant, how many of
+    its runs each controller ends on a wrong mechanism. The exact McNemar test,
+    which treats runs as independent pairs, is kept in the JSON only."""
     ka = {k: np.mean(v) > 0.5 for k, v in W[a].items()}
     kb = {k: np.mean(v) > 0.5 for k, v in W[b].items()}
     ks = sorted(set(ka) & set(kb))
@@ -127,6 +130,16 @@ def lockin(W, a, b, rng=None):
            "count": (int(sum(ka[k] for k in ks)), int(sum(kb[k] for k in ks))),
            "discordant": (n10, n01), "mcnemar_p": p, "n_runs": len(ks),
            "n_plants": len({(k[0], k[2] // 10) for k in ks})}
+    pl = defaultdict(lambda: [0, 0])
+    for k in ks:
+        pl[(k[0], k[2] // 10)][0] += ka[k]
+        pl[(k[0], k[2] // 10)][1] += kb[k]
+    fewer = sum(1 for v in pl.values() if v[0] < v[1])   # a locks in less often
+    more = sum(1 for v in pl.values() if v[0] > v[1])
+    ns = fewer + more
+    out["plants_fewer_more"] = (fewer, more)
+    out["sign_p_plants"] = (min(1.0, 2 * sum(comb(ns, i) for i in range(min(fewer, more) + 1))
+                                / 2 ** ns) if ns else 1.0)
     if rng is not None:
         # per plant: (lock-ins of a, lock-ins of b, runs), grouped by test set
         per = defaultdict(lambda: np.zeros(3))
@@ -225,8 +238,12 @@ def table(o):
          r"reference over the worst 10\% / 5\% of plant-scenarios. "
          r"\emph{Severe}: share of plant-scenarios more than 50 / 100 behind "
          r"the reference. \emph{Lock-in}: share and number of runs ending on a "
-         r"wrong network mechanism. The exact McNemar test on the discordant runs "
-         r"treats runs as independent pairs, the clustered interval does not. "
+         r"wrong network mechanism. Because a plant's runs are not independent, "
+         r"lock-in is tested with plants as the unit: the clustered interval of the "
+         r"reduction, and the number of plants on which the first controller ends "
+         f"fewer / more of its runs on a wrong mechanism than the second (of "
+         f"{next(iter(o.values()))['lockin']['n_plants']}), with an exact "
+         r"two-sided sign test. "
          r"Reductions are second minus first, with 95\% CIs (lock-in in "
          r"percentage points).}",
          r"\label{tab:pooled}", r"\footnotesize", r"\setlength{\tabcolsep}{3pt}",
@@ -256,8 +273,8 @@ def table(o):
             ("severe $>$100 (first / second)", lambda v: f"{100*v['severe100'][0]:.1f}\\% / {100*v['severe100'][1]:.1f}\\%"),
             (f"lock-in, runs (first / second)", lk),
             ("\\quad reduction [95\\% CI], pp", lkr),
-            ("\\quad discordant runs", lambda v: f"{v['lockin']['discordant'][0]} / {v['lockin']['discordant'][1]}"),
-            ("\\quad McNemar $p$", lambda v: f"{v['lockin']['mcnemar_p']:.2g}")]
+            ("\\quad plants, fewer / more", lambda v: f"{v['lockin']['plants_fewer_more'][0]} / {v['lockin']['plants_fewer_more'][1]}"),
+            ("\\quad sign test $p$ (plants)", lambda v: f"{v['lockin']['sign_p_plants']:.2g}")]
     for lab, fn in rows:
         L.append(lab + " & " + " & ".join(fn(v) for v in o.values()) + r" \\")
     L += [r"\bottomrule", r"\end{tabular}", r"\end{table*}", ""]

@@ -54,6 +54,7 @@ python experiments/cp_dual.py             # against approximate dual control (re
 python experiments/cp_fleetcal.py && python experiments/cp_fleetcal.py --contamination
 python experiments/cp_tausens.py          # sensitivity to mis-estimated free-learning horizons
 python experiments/cp_profile.py          # per-step compute and memory of the controllers
+python experiments/cp_false_alarms.py     # misfit-detector false alarms on the in-library test runs
 python experiments/cp_verify_frozen.py --replay   # frozen code states
 python experiments/cp_split_tables.py     # one file per table in paper/tables/
 ```
